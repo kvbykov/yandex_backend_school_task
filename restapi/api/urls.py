@@ -3,11 +3,9 @@ from . import views
 
 
 urlpatterns = [
-    path('', views.index, name='index'),
-    path('nodes/<slug:uuid>', views.nodes, name='nodes'),
+    path('nodes/<slug:uuid>', views.get_unit, name='get_unit'),
     path('delete/<slug:uuid>', views.delete, name='delete'),
-    path('imports', views.imports, name='imports'),
-    path('sales/<str:date>', views.sales, name='sales'),
-    path('node/<slug:uuid>/statistic/', views.stats, name='stats'),
-    # path('test/', views.test, name='test'),
+    path('imports', views.import_units, name='import_units'),
+    path('sales/<str:request_date>', views.get_recently_updated, name='get_recently_updated'),
+    path('node/<slug:uuid>/statistic/', views.get_statistics, name='get_statistics'),
 ]

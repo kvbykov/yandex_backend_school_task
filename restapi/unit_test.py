@@ -185,9 +185,9 @@ def request(path, method="GET", data=None, json_response=False):
             res_data = res.read().decode("utf-8")
             if json_response:
                 res_data = json.loads(res_data)
-            return (res.getcode(), res_data)
+            return res.getcode(), res_data
     except urllib.error.HTTPError as e:
-        return (e.getcode(), None)
+        return e.getcode(), e
 
 
 def deep_sort_children(node):
@@ -216,7 +216,7 @@ def test_import():
         print(f"Importing batch {index}")
         status, _ = request("/imports", method="POST", data=batch)
 
-        assert status == 200, f"Expected HTTP status code 200, got {status}"
+        assert status == 200, f"Expected HTTP status code 200, got {status}, {_}"
 
     print("Test import passed.")
 
@@ -273,9 +273,9 @@ def test_delete():
 def test_all():
     test_import()
     test_nodes()
-    # test_sales()
-    # test_stats()
-    test_delete()
+    # # test_sales()
+    # # test_stats()
+    # test_delete()
 
 
 def main():
