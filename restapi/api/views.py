@@ -1,183 +1,105 @@
-import datetime
 import json
-
-from django.http import HttpResponse, Http404, HttpResponseNotFound, JsonResponse
-from .models import Unit, History
-
-
-# ====================== index ====================== #
-
-def index(request):
-    ...
-
-
-# ====================== nodes ====================== #
-
-def serialize(unit):
-    is_category = unit.type == 'CATEGORY'
-    response = {'type': unit.type,
-                'name': unit.name,
-                'id': unit.id,
-                'parentId': unit.parent.id if unit.parent else None,
-                'price': unit.price,
-                'date': unit.date.strftime('%Y-%m-%dT%H:%M:%S.000Z'),
-                'children': [serialize(child) for child in unit.unit_set.all()] if is_category else None,
-                }
-    return response
+from django.db import transaction
+from django.http import JsonResponse
+from .models import Unit
+from django.core.exceptions import ValidationError
+from .services import get_dict_from_unit
+from .services import get_datetime_object
+from .services import get_dict_from_history
+from .services import get_requested_object
+from .services import get_date_range
+from .services import create_unit_instance
+from .services import update_dates
+from .services import get_update_data
+from .services import update_prices
+from .services import save_history
+from .validators import validate_date
+from .validators import validate_all_params
 
 
-def nodes(request, uuid):
-    try:
-        unit = Unit.objects.get(pk=uuid)
-    except Unit.DoesNotExist:
-        return HttpResponseNotFound('{"code": 404, "message": "Item not found"}')
-    response = serialize(unit)
+def get_unit(request, uuid):
+    unit_or_response = get_requested_object(uuid)
+    if isinstance(unit_or_response, JsonResponse):
+        return unit_or_response
+    response = get_dict_from_unit(unit_or_response)
     return JsonResponse(response, json_dumps_params={'ensure_ascii': False})
 
 
-# ====================== delete ====================== #
-
+@transaction.atomic
 def delete(request, uuid):
-    try:
-        unit = Unit.objects.get(pk=uuid)
-    except Unit.DoesNotExist:
-        return HttpResponseNotFound('{"code": 404, "message": "Item not found"}')
-    unit.delete()
-    return HttpResponse('{"code": 200, "message": "Deleted"}')
+    unit_or_response = get_requested_object(uuid)
+    if isinstance(unit_or_response, JsonResponse):
+        return unit_or_response
+    unit_or_response.delete()
+    return JsonResponse({"code": 200, "message": "Deleted"},
+                        json_dumps_params={'ensure_ascii': False})
 
 
-# ====================== imports ======================
+@transaction.atomic
+def import_units(request):
+    request_body = json.loads(request.body.decode())
+    update_date = request_body["updateDate"]
+    import_items = request_body["items"]
 
-def save_history(item_id):
-    item = Unit.objects.get(pk=item_id)
-    if item.type == 'OFFER':
-        values = {'name': item.name,
-                  'date': item.date,
-                  'price': item.price,
-                  'parentId': item.parent.id if item.parent else None,
-                  'unit': item,
-                  }
-        obj = History(**values)
-        obj.save()
-    return None
+    affected_categories_ids, updated_or_added_ids = get_update_data(import_items)
 
+    for import_item in import_items:
+        try:
+            validate_all_params(import_item, update_date)
+            unit_instance = create_unit_instance(import_item, update_date)
+        except ValidationError as e:
+            transaction.set_rollback(True)
+            return JsonResponse({"code": 400, "message": e.message},
+                                status=400,
+                                json_dumps_params={'ensure_ascii': False})
+        unit_instance.save()
 
-def update_prices():
-    def traverse(unit, offer_count=0, sum_price=0):
-        if unit.type == 'OFFER':
-            price = unit.price
-            return price, 1
-        else:
-            children = unit.unit_set.all()
-            if children:
-                for child in children:
-                    cost, offers = traverse(child)
-                    sum_price += cost
-                    offer_count += offers
-                unit.price = sum_price // offer_count
-                unit.save()
-            else:
-                unit.price = None
-                unit.save()
-            return sum_price, offer_count
-
-    root_units = Unit.objects.filter(parent=None)
-
-    for root_unit in root_units:
-        traverse(root_unit)
-
-
-def update_dates(affected_categories_ids, date):
-    def traverse(category):
-        if category.parent and category not in updated:
-            updated.add(category)
-            category.date = date
-            category.save()
-            category = category.parent
-            traverse(category)
-        else:
-            updated.add(category)
-            category.date = date
-            category.save()
-
-    updated = set()
-    for category_id in affected_categories_ids:
-        category = Unit.objects.get(pk=category_id)
-        traverse(category)
-    return None
-
-
-def deserialize(item, date):
-    values = {'pk': item['id'],
-              'name': item['name'],
-              'price': item['price'] if 'price' in item else None,
-              'date': date,
-              'parent': None if item['parentId'] is None else Unit.objects.get(pk=item['parentId']),
-              'type': item['type'],
-              }
-    item = Unit(**values)
-    return item
-
-
-def imports(request):
-    body = json.loads(request.body.decode())
-    date = body['updateDate']
-    items = body['items']
-    affected_categories_ids = set()
-    updated_or_added_ids = []
-    for item in items:
-        if item['parentId'] is not None:
-            affected_categories_ids.add(item['parentId'])
-        item = deserialize(item, date)
-        item.save()
-        updated_or_added_ids.append(item.id)
-    update_dates(affected_categories_ids, date)
+    update_dates(affected_categories_ids, update_date)
     update_prices()
-    for unit_id in updated_or_added_ids:
-        save_history(unit_id)
-    response = {'code': 200,
-                'message': 'Successfully imported all objects',
-                }
-    return JsonResponse(response)
+    for item_id in updated_or_added_ids:
+        save_history(item_id)
+    return JsonResponse({"code": 200, "message": "Import or update went successful"},
+                        json_dumps_params={'ensure_ascii': False})
 
 
-# ====================== sales ====================== #
-
-def sales(request, date):
-    date = datetime.datetime.strptime(date, '%Y-%m-%dT%H:%M:%S.000Z')
-    yesterday = date - datetime.timedelta(days=1)
+def get_recently_updated(request, request_date):
+    try:
+        validate_date(request_date)
+    except ValidationError as e:
+        return JsonResponse({"code": 400, "message": e.message},
+                            status=400,
+                            json_dumps_params={'ensure_ascii': False})
+    date_range = get_date_range(request_date)
     response = {"items": []}
-    for obj in Unit.objects.filter(type='OFFER'):
-        if yesterday <= obj.date.replace(tzinfo=None):
-            response_obj = {'type': 'OFFER',
-                            'name': obj.name,
-                            'id': obj.id,
-                            'parentId': obj.parent.id if obj.parent else None,
-                            'price': obj.price,
-                            'date': obj.date.strftime('%Y-%m-%dT%H:%M:%S.000Z'),
-                            'children': None,
-                            }
-            response['items'].append(response_obj)
+    for unit in Unit.objects.filter(date__range=date_range).filter(type='OFFER'):
+        dict_unit = get_dict_from_unit(unit)
+        response['items'].append(dict_unit)
     return JsonResponse(response, json_dumps_params={'ensure_ascii': False})
 
 
-# ====================== stats ====================== #
+def get_statistics(request, uuid):
+    unit_or_response = get_requested_object(uuid)
+    if isinstance(unit_or_response, JsonResponse):
+        return unit_or_response
+    unit = unit_or_response
 
-def stats(request, uuid):
-    # query = request.GET
-    # start = datetime.datetime.strptime(query['dateStart'], '%Y-%m-%dT%H:%M:%S.000Z')
-    # end = datetime.datetime.strptime(query['dateEnd'], '%Y-%m-%dT%H:%M:%S.000Z')
-    # item = None
-    # try:
-    #     item = Category.objects.get(pk=uuid)
-    # except Category.DoesNotExist:
-    #     pass
-    # try:
-    #     item = Offer.objects.get(pk=uuid)
-    # except Offer.DoesNotExist:
-    #     pass
-    # if item is None:
-    ...
+    query = request.GET
+    date_start = query["dateStart"]
+    date_end = query["dateEnd"]
 
-def test_transactions(request):
-    obj = Unit(id='069cb8d7-bbdd-47d3-ad8f-82ef4c269df1', name='TEST', price=228, type='')
+    try:
+        validate_date(date_start)
+        validate_date(date_end)
+    except ValidationError as e:
+        return JsonResponse({"code": 400, "message": e.message},
+                            status=400,
+                            json_dumps_params={'ensure_ascii': False})
+
+    date_start = get_datetime_object(date_start)
+    date_end = get_datetime_object(date_end)
+
+    response = {"items": []}
+    for history_unit in unit.history_set.all().filter(date__range=(date_start, date_end)):
+        dict_unit = get_dict_from_history(history_unit)
+        response["items"].append(dict_unit)
+    return JsonResponse(response, json_dumps_params={'ensure_ascii': False})
